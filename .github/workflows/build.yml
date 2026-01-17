@@ -1,4 +1,4 @@
-name: Build Mongoose (v7.20+) with mbedTLS + MinGW
+name: Build Mongoose (Pragmatic)
 
 on: [push, workflow_dispatch]
 
@@ -10,11 +10,11 @@ jobs:
         arch: [x86_64, i686]
         build_type: [static, shared]
     steps:
-      - name: Checkout Mongoose (source only)
+      - name: Checkout Mongoose
         uses: actions/checkout@v4
         with:
           repository: cesanta/mongoose
-          ref: 7.20  # or 'master' for latest
+          ref: 7.20
 
       - name: Checkout mbedTLS
         uses: actions/checkout@v4
@@ -24,6 +24,7 @@ jobs:
           path: mbedtls
           submodules: recursive
 
+      # === 使用你已验证的 MinGW 包 ===
       - name: Set MinGW URL
         id: mingw
         shell: bash
@@ -48,72 +49,66 @@ jobs:
         run: |
           echo "${{ github.workspace }}/${{ steps.mingw.outputs.DIR }}/bin" >> $GITHUB_PATH
 
-      # ===== 1. 编译 mbedTLS =====
+      # === 编译 mbedTLS ===
       - name: Build mbedTLS
         shell: bash
         run: |
           mkdir -p mbedtls/build && cd mbedtls/build
           cmake .. \
-            -G "MinGW Makefiles" \
+            -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc
           cmake --build .
 
-      # ===== 2. 创建 CMakeLists.txt for Mongoose =====
+      # === 生成 CMakeLists.txt（简化版）===
       - name: Create CMakeLists.txt
         shell: bash
         run: |
           cat > CMakeLists.txt << 'EOF'
           cmake_minimum_required(VERSION 3.10)
           project(mongoose LANGUAGES C)
-
-          option(MONGOOSE_ENABLE_MBEDTLS "Enable mbedTLS support" OFF)
-
           add_library(mongoose mongoose.c)
-
           target_include_directories(mongoose PUBLIC .)
-
-          if(MONGOOSE_ENABLE_MBEDTLS)
-              find_path(MBEDTLS_INCLUDE_DIR mbedtls/ssl.h)
-              find_library(MBEDTLS_LIBRARY mbedtls)
-              find_library(MBEDX509_LIBRARY mbedx509)
-              find_library(MBEDCRYPTO_LIBRARY mbedcrypto)
-
-              target_include_directories(mongoose PRIVATE ${MBEDTLS_INCLUDE_DIR})
-              target_link_libraries(mongoose ${MBEDTLS_LIBRARY} ${MBEDX509_LIBRARY} ${MBEDCRYPTO_LIBRARY})
-              target_compile_definitions(mongoose PRIVATE MG_ENABLE_MBEDTLS=1)
+          if(DEFINED ENV{MBEDTLS_INCLUDE_DIR})
+            target_include_directories(mongoose PRIVATE $ENV{MBEDTLS_INCLUDE_DIR})
+            target_link_libraries(mongoose 
+              $ENV{MBEDTLS_LIBRARY}
+              $ENV{MBEDX509_LIBRARY}
+              $ENV{MBEDCRYPTO_LIBRARY}
+            )
+            target_compile_definitions(mongoose PRIVATE MG_ENABLE_MBEDTLS=1)
           endif()
-
           if(BUILD_SHARED_LIBS)
-              set_target_properties(mongoose PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+            set_target_properties(mongoose PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
           endif()
           EOF
-      #编译mongoose
+
+      # === 编译 Mongoose ===
       - name: Build Mongoose
         shell: bash
+        env:
+          MBEDTLS_INCLUDE_DIR: ${{ github.workspace }}/mbedtls/include
+          MBEDTLS_LIBRARY: ${{ github.workspace }}/mbedtls/build/library/libmbedtls.a
+          MBEDX509_LIBRARY: ${{ github.workspace }}/mbedtls/build/library/libmbedx509.a
+          MBEDCRYPTO_LIBRARY: ${{ github.workspace }}/mbedtls/build/library/libmbedcrypto.a
         run: |
           mkdir -p build && cd build
           cmake .. \
-          -G "Ninja" \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_C_COMPILER=gcc \
-          -DBUILD_SHARED_LIBS=${{ matrix.build_type == 'shared' && 'ON' || 'OFF' }} \
-          -DMONGOOSE_ENABLE_MBEDTLS=ON \
-          -DMBEDTLS_INCLUDE_DIR=${{ github.workspace }}/mbedtls/include \
-          -DMBEDTLS_LIBRARY=${{ github.workspace }}/mbedtls/build/library/libmbedtls.a \
-          -DMBEDX509_LIBRARY=${{ github.workspace }}/mbedtls/build/library/libmbedx509.a \
-          -DMBEDCRYPTO_LIBRARY=${{ github.workspace }}/mbedtls/build/library/libmbedcrypto.a
+            -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc \
+            -DBUILD_SHARED_LIBS=${{ matrix.build_type == 'shared' && 'ON' || 'OFF' }}
           cmake --build .
 
-      # ===== 4. 收集产物 =====
+      # === 收集产物 ===
       - name: Collect artifacts
         shell: bash
         run: |
           mkdir -p artifacts
           cd build
           if [[ "${{ matrix.build_type }}" == "shared" ]]; then
-            cp libmongoose.dll.a ../artifacts/ 2>/dev/null || true
             cp mongoose.dll ../artifacts/ 2>/dev/null || true
+            cp libmongoose.dll.a ../artifacts/ 2>/dev/null || true
           else
             cp libmongoose.a ../artifacts/ 2>/dev/null || true
           fi
@@ -122,5 +117,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mongoose-${{ matrix.arch }}-${{ matrix.build_type }}-gcc93-sjlj-tls
+          name: mongoose-${{ matrix.arch }}-${{ matrix.build_type }}-sjlj-tls
           path: artifacts/
