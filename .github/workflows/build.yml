@@ -63,7 +63,7 @@ jobs:
             -G "Ninja" ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_SYSTEM_NAME=Windows ^
-            -DCMAKE_C_COMPILER=${{ steps.mingw.outputs.ARCH == 'x86_64' && 'x86_64-w64-mingw32-gcc' || 'i686-w64-mingw32-gcc' }}
+            -DCMAKE_C_COMPILER=gcc
           cmake --build .
 
       # ===== 3. 编译 Mongoose with mbedTLS =====
@@ -74,6 +74,7 @@ jobs:
           cmake .. ^
             -G "Ninja" ^
             -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_C_COMPILER=gcc ^
             -DBUILD_SHARED_LIBS=${{ matrix.build_type == 'shared' && 'ON' || 'OFF' }} ^
             -DMONGOOSE_ENABLE_MBEDTLS=ON ^
             -DMBEDTLS_ROOT_DIR=${{ github.workspace }}/mbedtls ^
