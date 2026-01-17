@@ -59,10 +59,10 @@ jobs:
         shell: bash
         run: |
           mkdir mbedtls/build && cd mbedtls/build
-          cmake .. ^
-            -G "Ninja" ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_SYSTEM_NAME=Windows ^
+          cmake .. \
+            -G "MinGW Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Windows \
             -DCMAKE_C_COMPILER=gcc
           cmake --build .
 
@@ -71,16 +71,16 @@ jobs:
         shell: bash
         run: |
           mkdir mongoose-build && cd mongoose-build
-          cmake .. ^
-            -G "Ninja" ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_C_COMPILER=gcc ^
-            -DBUILD_SHARED_LIBS=${{ matrix.build_type == 'shared' && 'ON' || 'OFF' }} ^
-            -DMONGOOSE_ENABLE_MBEDTLS=ON ^
-            -DMBEDTLS_ROOT_DIR=${{ github.workspace }}/mbedtls ^
-            -DMBEDTLS_INCLUDE_DIR=${{ github.workspace }}/mbedtls/include ^
-            -DMBEDTLS_LIBRARY=${{ github.workspace }}/mbedtls/build/library/libmbedtls.a ^
-            -DMBEDX509_LIBRARY=${{ github.workspace }}/mbedtls/build/library/libmbedx509.a ^
+          cmake .. \
+            -G "MinGW Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc \
+            -DBUILD_SHARED_LIBS=${{ matrix.build_type == 'shared' && 'ON' || 'OFF' }} \
+            -DMONGOOSE_ENABLE_MBEDTLS=ON \
+            -DMBEDTLS_ROOT_DIR=${{ github.workspace }}/mbedtls \
+            -DMBEDTLS_INCLUDE_DIR=${{ github.workspace }}/mbedtls/include \
+            -DMBEDTLS_LIBRARY=${{ github.workspace }}/mbedtls/build/library/libmbedtls.a \
+            -DMBEDX509_LIBRARY=${{ github.workspace }}/mbedtls/build/library/libmbedx509.a \
             -DMBEDCRYPTO_LIBRARY=${{ github.workspace }}/mbedtls/build/library/libmbedcrypto.a
 
       - name: Build Mongoose
