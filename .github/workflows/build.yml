@@ -22,7 +22,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install Tools
+    - name: Install 7-Zip
       run: |
         choco install 7zip -y
         "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Append
@@ -30,20 +30,17 @@ jobs:
     - name: Build All
       shell: pwsh
       run: |
-        # 配置路径
+        # 1. 下载并解压 MinGW
         $mingwUrl = "https://github.com/brechtsanders/winlibs_mingw/releases/download/9.3.0-7.0.0-sjlj-r3/${{ matrix.file }}"
         $mingwArchive = "D:\mingw.7z"
-        $mingwRoot = "C:\mingw\${{ matrix.prefix }}"
-        $mingwBin = "$mingwRoot\bin"
-        $mbedtlsSrc = "C:\mbedtls-src"
-        $mbedtlsInstall = "C:\mbedtls-install"
-        $mongooseSrc = "mongoose-src"
+        $mingwBase = "C:\mingw"
+        $expectedPrefix = "${{ matrix.prefix }}"
         
-        # 下载 MinGW
-        Write-Host ">>> Downloading MinGW..."
+        # 下载（带重试）
         $attempt = 0
         do {
           $attempt++
+          Write-Host "Downloading MinGW (attempt $attempt)..."
           curl.exe -L -o $mingwArchive $mingwUrl --fail --silent --show-error --max-time 180
           if ($LASTEXITCODE -eq 0) { break }
           Start-Sleep -Seconds 5
@@ -51,30 +48,53 @@ jobs:
         
         if (-not (Test-Path $mingwArchive)) { throw "Failed to download MinGW" }
         
-        & "C:\Program Files\7-Zip\7z.exe" x $mingwArchive -o"$mingwRoot" -y
-        $env:PATH = "$mingwBin;" + $env:PATH
+        # 清理并解压
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $mingwBase
+        New-Item -ItemType Directory -Force -Path $mingwBase | Out-Null
+        & "C:\Program Files\7-Zip\7z.exe" x $mingwArchive -o"$mingwBase" -y
+        if ($LASTEXITCODE -ne 0) { throw "Extraction failed" }
         
-        # 验证
+        # 检测 MinGW 实际路径（WinLibs 压缩包内部包含 mingw32/mingw64 目录）
+        $mingwBin = "$mingwBase\$expectedPrefix\bin"
+        if (-not (Test-Path "$mingwBin\gcc.exe")) {
+          # 备用：检查是否在根目录
+          if (Test-Path "$mingwBase\bin\gcc.exe") {
+            $mingwBin = "$mingwBase\bin"
+          } else {
+            # 显示目录结构帮助调试
+            Write-Host "=== Available directories ==="
+            Get-ChildItem $mingwBase | Select-Object Name
+            throw "gcc.exe not found at $mingwBin"
+          }
+        }
+        
+        Write-Host ">>> MinGW found at: $mingwBin"
+        $env:PATH = "$mingwBin;" + $env:PATH
         & "$mingwBin\gcc.exe" --version
         
-        # 下载源码
-        git clone --depth 1 https://github.com/cesanta/mongoose.git $mongooseSrc
+        # 2. 下载源码
+        git clone --depth 1 https://github.com/cesanta/mongoose.git mongoose-src
         curl.exe -L -o "D:\mbedtls.zip" "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v3.6.5.zip" --fail --silent --show-error
         Expand-Archive -Path "D:\mbedtls.zip" -DestinationPath "C:\" -Force
-        Rename-Item -Path "C:\mbedtls-3.6.5" -NewName $mbedtlsSrc -Force
+        Rename-Item -Path "C:\mbedtls-3.6.5" -NewName "C:\mbedtls-src" -Force
         
-        # 构建 mbedTLS
-        Write-Host ">>> Building mbedTLS..."
+        # 3. 构建 mbedTLS
+        $mbedtlsSrc = "C:\mbedtls-src"
+        $mbedtlsInstall = "C:\mbedtls-install"
+        
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $mbedtlsInstall
         New-Item -ItemType Directory -Force -Path "$mbedtlsSrc\build" | Out-Null
         Set-Location "$mbedtlsSrc\build"
         
         $cmake = Get-Command cmake | Select-Object -First 1 | ForEach-Object { $_.Source }
-        if (-not $cmake) { $cmake = "cmake" }
+        if (-not $cmake) { $cmake = "C:\Program Files\CMake\bin\cmake.exe" }
+        if (-not (Test-Path $cmake)) { $cmake = "cmake" }
         
         & $cmake -G "MinGW Makefiles" .. `
           -DCMAKE_BUILD_TYPE=Release `
           -DCMAKE_C_COMPILER="$mingwBin\gcc.exe" `
+          -DCMAKE_AR="$mingwBin\ar.exe" `
+          -DCMAKE_RANLIB="$mingwBin\ranlib.exe" `
           -DCMAKE_INSTALL_PREFIX="$mbedtlsInstall" `
           -DENABLE_TESTING=OFF `
           -DENABLE_PROGRAMS=OFF `
@@ -83,18 +103,17 @@ jobs:
         if ($LASTEXITCODE -ne 0) { throw "CMake failed" }
         
         & "$mingwBin\mingw32-make.exe" -j4
-        if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+        if ($LASTEXITCODE -ne 0) { throw "mbedTLS build failed" }
         
         & "$mingwBin\mingw32-make.exe" install
-        if ($LASTEXITCODE -ne 0) { throw "Install failed" }
+        if ($LASTEXITCODE -ne 0) { throw "mbedTLS install failed" }
         
         if (-not (Test-Path "$mbedtlsInstall\lib\libmbedcrypto.a")) {
-          throw "mbedTLS install verification failed"
+          throw "mbedTLS libraries not found after install"
         }
         
-        # 构建 Mongoose
-        Write-Host ">>> Building Mongoose..."
-        $buildDir = "$mongooseSrc\build-${{ matrix.arch }}"
+        # 4. 构建 Mongoose
+        $buildDir = "mongoose-src\build-${{ matrix.arch }}"
         New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
         Set-Location $buildDir
         
@@ -104,8 +123,7 @@ jobs:
         & "$mingwBin\ar.exe" rcs libmongoose.a mongoose.o
         & "$mingwBin\ranlib.exe" libmongoose.a
         
-        # 测试链接（关键修复：使用 Add-Content 代替 here-string）
-        Write-Host ">>> Testing..."
+        # 5. 测试链接
         Set-Content -Path "test.c" -Value '#include "mongoose.h"' -Encoding ASCII
         Add-Content -Path "test.c" -Value '#include <stdio.h>' -Encoding ASCII
         Add-Content -Path "test.c" -Value 'int main(void) {' -Encoding ASCII
@@ -117,23 +135,18 @@ jobs:
         Add-Content -Path "test.c" -Value '}' -Encoding ASCII
         
         & "$mingwBin\gcc.exe" -static test.c -I.. -I"$mbedtlsInstall\include" -L. -lmongoose -L"$mbedtlsInstall\lib" -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lwsock32 -lbcrypt -o test.exe
-        
         if (-not (Test-Path "test.exe")) { throw "Linking failed" }
         & ".\test.exe"
         
-        # 打包
-        Write-Host ">>> Packaging..."
+        # 6. 打包
         $pkg = "mongoose-mbedtls365-${{ matrix.arch }}"
         New-Item -ItemType Directory -Path "$pkg\lib", "$pkg\include\mbedtls", "$pkg\include\psa" -Force | Out-Null
-        
         Copy-Item "libmongoose.a" "$pkg\lib\"
         Copy-Item "..\mongoose.h" "$pkg\include\"
         Copy-Item "$mbedtlsInstall\lib\*.a" "$pkg\lib\"
         Copy-Item "$mbedtlsInstall\include\mbedtls\*.h" "$pkg\include\mbedtls\"
         Copy-Item "$mbedtlsInstall\include\psa\*.h" "$pkg\include\psa\" -ErrorAction SilentlyContinue
-        
-        "Link order: -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt -static" | Out-File "$pkg\README.txt"
-        
+        "Link: gcc app.c -I./include -L./lib -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt -static" | Out-File "$pkg\README.txt"
         Compress-Archive -Path $pkg -DestinationPath "$env:GITHUB_WORKSPACE\mongoose-mbedtls365-${{ matrix.arch }}.zip" -Force
 
     - name: Upload
@@ -141,7 +154,6 @@ jobs:
       with:
         name: mongoose-mbedtls365-${{ matrix.arch }}
         path: mongoose-mbedtls365-*.zip
-        if-no-files-found: error
 
   release:
     needs: build
@@ -149,12 +161,12 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
-    
     steps:
     - uses: actions/download-artifact@v4
+      with:
+        merge-multiple: true
     - uses: softprops/action-gh-release@v1
       with:
         files: mongoose-mbedtls365-*.zip
-        name: Mongoose + mbedTLS 3.6.5 (GCC 9.3 SJLJ) ${{ github.ref_name }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
