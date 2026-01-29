@@ -22,17 +22,15 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    # 1. 安装依赖工具
     - name: Install Tools
       run: |
         choco install 7zip -y
         "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-    # 2. 完整构建流程（单一步骤确保环境变量一致）
-    - name: Build All (MinGW + mbedTLS + Mongoose)
+    - name: Build All
       shell: pwsh
       run: |
-        # ===== 配置路径 =====
+        # 配置路径
         $mingwUrl = "https://github.com/brechtsanders/winlibs_mingw/releases/download/9.3.0-7.0.0-sjlj-r3/${{ matrix.file }}"
         $mingwArchive = "D:\mingw.7z"
         $mingwRoot = "C:\mingw\${{ matrix.prefix }}"
@@ -41,7 +39,7 @@ jobs:
         $mbedtlsInstall = "C:\mbedtls-install"
         $mongooseSrc = "mongoose-src"
         
-        # ===== 下载 MinGW =====
+        # 下载 MinGW
         Write-Host ">>> Downloading MinGW..."
         $attempt = 0
         do {
@@ -53,121 +51,77 @@ jobs:
         
         if (-not (Test-Path $mingwArchive)) { throw "Failed to download MinGW" }
         
-        # 解压
         & "C:\Program Files\7-Zip\7z.exe" x $mingwArchive -o"$mingwRoot" -y
-        
-        # 立即更新当前进程的 PATH
         $env:PATH = "$mingwBin;" + $env:PATH
         
         # 验证
-        Write-Host ">>> Verifying MinGW..."
         & "$mingwBin\gcc.exe" --version
-        if ($LASTEXITCODE -ne 0) { throw "GCC not working" }
         
-        # ===== 下载源码 =====
-        Write-Host ">>> Downloading sources..."
-        
-        # Mongoose
+        # 下载源码
         git clone --depth 1 https://github.com/cesanta/mongoose.git $mongooseSrc
-        
-        # mbedTLS 3.6.5
         curl.exe -L -o "D:\mbedtls.zip" "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v3.6.5.zip" --fail --silent --show-error
         Expand-Archive -Path "D:\mbedtls.zip" -DestinationPath "C:\" -Force
         Rename-Item -Path "C:\mbedtls-3.6.5" -NewName $mbedtlsSrc -Force
         
-        # ===== 构建 mbedTLS =====
-        Write-Host ">>> Building mbedTLS 3.6.5..."
-        
-        # 清理并创建构建目录
+        # 构建 mbedTLS
+        Write-Host ">>> Building mbedTLS..."
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $mbedtlsInstall
         New-Item -ItemType Directory -Force -Path "$mbedtlsSrc\build" | Out-Null
-        
-        # 使用绝对路径调用 CMake 和 Make
-        $cmake = "C:\Program Files\CMake\bin\cmake.exe"
-        if (-not (Test-Path $cmake)) { $cmake = "cmake" }  # 如果不在默认位置
-        
         Set-Location "$mbedtlsSrc\build"
         
-        # 配置（显式指定编译器路径）
+        $cmake = Get-Command cmake | Select-Object -First 1 | ForEach-Object { $_.Source }
+        if (-not $cmake) { $cmake = "cmake" }
+        
         & $cmake -G "MinGW Makefiles" .. `
           -DCMAKE_BUILD_TYPE=Release `
           -DCMAKE_C_COMPILER="$mingwBin\gcc.exe" `
-          -DCMAKE_AR="$mingwBin\ar.exe" `
-          -DCMAKE_RANLIB="$mingwBin\ranlib.exe" `
           -DCMAKE_INSTALL_PREFIX="$mbedtlsInstall" `
           -DENABLE_TESTING=OFF `
           -DENABLE_PROGRAMS=OFF `
           -DGEN_FILES=OFF
         
-        if ($LASTEXITCODE -ne 0) {
-          Write-Host "=== CMake Output ==="
-          Get-Content "CMakeFiles\CMakeOutput.log" -ErrorAction SilentlyContinue | Select-Object -First 30
-          throw "CMake configuration failed"
-        }
+        if ($LASTEXITCODE -ne 0) { throw "CMake failed" }
         
-        # 构建
         & "$mingwBin\mingw32-make.exe" -j4
-        if ($LASTEXITCODE -ne 0) { throw "mbedTLS build failed" }
+        if ($LASTEXITCODE -ne 0) { throw "Build failed" }
         
-        # 安装
         & "$mingwBin\mingw32-make.exe" install
-        if ($LASTEXITCODE -ne 0) { throw "mbedTLS install failed" }
+        if ($LASTEXITCODE -ne 0) { throw "Install failed" }
         
-        # 验证安装
         if (-not (Test-Path "$mbedtlsInstall\lib\libmbedcrypto.a")) {
-          throw "mbedTLS libraries not found after install"
+          throw "mbedTLS install verification failed"
         }
-        Write-Host "✅ mbedTLS built and installed"
         
-        # ===== 构建 Mongoose =====
+        # 构建 Mongoose
         Write-Host ">>> Building Mongoose..."
         $buildDir = "$mongooseSrc\build-${{ matrix.arch }}"
         New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
         Set-Location $buildDir
         
-        # 编译
-        & "$mingwBin\gcc.exe" -c -O3 `
-          -DMG_ENABLE_IPV6=1 `
-          -DMG_ENABLE_LINES=1 `
-          -DMG_TLS=MG_TLS_MBED `
-          -DNDEBUG `
-          -I.. `
-          -I"$mbedtlsInstall\include" `
-          -static `
-          "..\mongoose.c" -o mongoose.o
-        
-        if ($LASTEXITCODE -ne 0) { throw "Mongoose compilation failed" }
+        & "$mingwBin\gcc.exe" -c -O3 -DMG_ENABLE_IPV6=1 -DMG_ENABLE_LINES=1 -DMG_TLS=MG_TLS_MBED -DNDEBUG -I.. -I"$mbedtlsInstall\include" -static "..\mongoose.c" -o mongoose.o
+        if ($LASTEXITCODE -ne 0) { throw "Mongoose compile failed" }
         
         & "$mingwBin\ar.exe" rcs libmongoose.a mongoose.o
         & "$mingwBin\ranlib.exe" libmongoose.a
         
-        # ===== 测试链接 =====
-        Write-Host ">>> Testing link..."
-        @'
-#include "mongoose.h"
-#include <stdio.h>
-int main(void) { 
-  struct mg_mgr mgr;
-  mg_mgr_init(&mgr);
-  printf("OK: Mongoose %s + mbedTLS 3.6.5\n", MG_VERSION); 
-  mg_mgr_free(&mgr);
-  return 0; 
-}
-'@ | Set-Content "test.c" -Encoding ASCII
+        # 测试链接（关键修复：使用 Add-Content 代替 here-string）
+        Write-Host ">>> Testing..."
+        Set-Content -Path "test.c" -Value '#include "mongoose.h"' -Encoding ASCII
+        Add-Content -Path "test.c" -Value '#include <stdio.h>' -Encoding ASCII
+        Add-Content -Path "test.c" -Value 'int main(void) {' -Encoding ASCII
+        Add-Content -Path "test.c" -Value '  struct mg_mgr mgr;' -Encoding ASCII
+        Add-Content -Path "test.c" -Value '  mg_mgr_init(&mgr);' -Encoding ASCII
+        Add-Content -Path "test.c" -Value '  printf("OK: Mongoose %s\n", MG_VERSION);' -Encoding ASCII
+        Add-Content -Path "test.c" -Value '  mg_mgr_free(&mgr);' -Encoding ASCII
+        Add-Content -Path "test.c" -Value '  return 0;' -Encoding ASCII
+        Add-Content -Path "test.c" -Value '}' -Encoding ASCII
         
-        & "$mingwBin\gcc.exe" -static test.c `
-          -I.. -I"$mbedtlsInstall\include" `
-          -L. -lmongoose `
-          -L"$mbedtlsInstall\lib" -lmbedtls -lmbedx509 -lmbedcrypto `
-          -lws2_32 -lwsock32 -lbcrypt `
-          -o test.exe
+        & "$mingwBin\gcc.exe" -static test.c -I.. -I"$mbedtlsInstall\include" -L. -lmongoose -L"$mbedtlsInstall\lib" -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lwsock32 -lbcrypt -o test.exe
         
         if (-not (Test-Path "test.exe")) { throw "Linking failed" }
+        & ".\test.exe"
         
-        $output = & ".\test.exe" 2>&1
-        Write-Host "Test output: $output"
-        
-        # ===== 打包 =====
+        # 打包
         Write-Host ">>> Packaging..."
         $pkg = "mongoose-mbedtls365-${{ matrix.arch }}"
         New-Item -ItemType Directory -Path "$pkg\lib", "$pkg\include\mbedtls", "$pkg\include\psa" -Force | Out-Null
@@ -178,41 +132,10 @@ int main(void) {
         Copy-Item "$mbedtlsInstall\include\mbedtls\*.h" "$pkg\include\mbedtls\"
         Copy-Item "$mbedtlsInstall\include\psa\*.h" "$pkg\include\psa\" -ErrorAction SilentlyContinue
         
-        # README
-        @"
-Mongoose + mbedTLS 3.6.5 (TLS 1.3)
-Arch: ${{ matrix.arch }}
-Compiler: MinGW GCC 9.3 SJLJ
-
-Link: gcc app.c -I./include -L./lib -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt -static
-"@ | Out-File "$pkg\README.txt"
+        "Link order: -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt -static" | Out-File "$pkg\README.txt"
         
-        # CMake config
-        @'
-add_library(mbedcrypto STATIC IMPORTED)
-set_target_properties(mbedcrypto PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT_LIST_DIR}/lib/libmbedcrypto.a")
+        Compress-Archive -Path $pkg -DestinationPath "$env:GITHUB_WORKSPACE\mongoose-mbedtls365-${{ matrix.arch }}.zip" -Force
 
-add_library(mbedx509 STATIC IMPORTED)
-set_target_properties(mbedx509 PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT_LIST_DIR}/lib/libmbedx509.a")
-target_link_libraries(mbedx509 INTERFACE mbedcrypto)
-
-add_library(mbedtls STATIC IMPORTED)
-set_target_properties(mbedtls PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT_LIST_DIR}/lib/libmbedtls.a")
-target_link_libraries(mbedtls INTERFACE mbedx509)
-
-add_library(mongoose STATIC IMPORTED GLOBAL)
-set_target_properties(mongoose PROPERTIES
-  IMPORTED_LOCATION "${CMAKE_CURRENT_LIST_DIR}/lib/libmongoose.a"
-  INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/include"
-  INTERFACE_COMPILE_DEFINITIONS "MG_TLS=MG_TLS_MBED;MG_ENABLE_IPV6=1"
-  INTERFACE_LINK_LIBRARIES "mbedtls;ws2_32;bcrypt"
-)
-'@ | Out-File "$pkg\mongoose-config.cmake"
-        
-        Compress-Archive -Path $pkg -DestinationPath "mongoose-mbedtls365-${{ matrix.arch }}.zip" -Force
-        Move-Item "mongoose-mbedtls365-${{ matrix.arch }}.zip" "$env:GITHUB_WORKSPACE\"
-
-    # 3. 上传产物
     - name: Upload
       uses: actions/upload-artifact@v4
       with:
@@ -229,20 +152,9 @@ set_target_properties(mongoose PROPERTIES
     
     steps:
     - uses: actions/download-artifact@v4
-      
     - uses: softprops/action-gh-release@v1
       with:
-        files: |
-          mongoose-mbedtls365-i686/*.zip
-          mongoose-mbedtls365-x86_64/*.zip
+        files: mongoose-mbedtls365-*.zip
         name: Mongoose + mbedTLS 3.6.5 (GCC 9.3 SJLJ) ${{ github.ref_name }}
-        body: |
-          ## Mongoose + mbedTLS 3.6.5 LTS (TLS 1.3)
-          
-          **Build**: MinGW-w64 GCC 9.3.0 SJLJ | **Arch**: i686 & x86_64
-          
-          **Link order**: `-lmongoose -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt`
-          
-          **Note**: Use `-static` to avoid `libgcc_s_sjlj-1.dll` dependency.
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
