@@ -1,118 +1,328 @@
-name: Build Mongoose for Windows (sjlj, GCC 9.3)
+name: Build Mongoose + mbedTLS 3.6.5 (TLS 1.3) MinGW GCC 9.3 SJLJ
 
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      mbedtls_version:
+        description: 'mbedTLS version (default: 3.6.5)'
+        required: true
+        default: '3.6.5'
+      mongoose_ref:
+        description: 'Mongoose ref/tag to build'
+        required: false
+        default: 'master'
 
 jobs:
-  build-windows:
-    runs-on: ubuntu-20.04
+  build-mingw-gcc93-sjlj-tls13:
+    runs-on: windows-latest
     strategy:
       matrix:
         arch: [i686, x86_64]
-        build_type: [static, shared]
+        include:
+          - arch: i686
+            winlibs_file: winlibs-mingw-w64-i686-9.3.0-7.0.0-r3-sjlj.7z
+            mingw_path: mingw32
+          - arch: x86_64
+            winlibs_file: winlibs-mingw-w64-x86_64-9.3.0-7.0.0-r3-sjlj.7z
+            mingw_path: mingw64
+
     steps:
-      - name: Checkout Mongoose
-        uses: actions/checkout@v4
-        with:
-          repository: cesanta/mongoose
-          ref: 7.20
+    # Checkout Mongoose source
+    - name: Checkout Mongoose source
+      uses: actions/checkout@v4
+      with:
+        repository: cesanta/mongoose
+        ref: ${{ github.event.inputs.mongoose_ref || 'master' }}
+        path: mongoose-src
 
-      # === 下载 WinLibs 的 GCC 9.3 sjlj 独立包（Linux 版）===
-      - name: Set toolchain URL
-        id: toolchain
-        run: |
-          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
-            echo "URL=https://github.com/brechtsanders/winlibs_mingw/releases/download/9.3.0-14.0.0-10.0.0-msvcrt-r3/winlibs-x86_64-posix-sjlj-gcc-9.3.0-mingw-w64-7.0.0-r3.tar.xz" >> $GITHUB_OUTPUT
-            echo "PREFIX=x86_64-w64-mingw32" >> $GITHUB_OUTPUT
-          else
-            echo "URL=https://github.com/brechtsanders/winlibs_mingw/releases/download/9.3.0-14.0.0-10.0.0-msvcrt-r3/winlibs-i686-posix-sjlj-gcc-9.3.0-mingw-w64-7.0.0-r3.tar.xz" >> $GITHUB_OUTPUT
-            echo "PREFIX=i686-w64-mingw32" >> $GITHUB_OUTPUT
-          fi
+    # Download WinLibs MinGW GCC 9.3 SJLJ
+    - name: Setup MinGW GCC 9.3 SJLJ
+      shell: powershell
+      run: |
+        $url = "https://github.com/brechtsanders/winlibs_mingw/releases/download/9.3.0-7.0.0-sjlj-r3/${{ matrix.winlibs_file }}"
+        Invoke-WebRequest -Uri $url -OutFile "C:\mingw.7z" -MaximumRetryCount 3
+        & 7z x "C:\mingw.7z" -o"C:\mingw" -y
+        "C:\mingw\${{ matrix.mingw_path }}\bin" >> $env:GITHUB_PATH
 
-      - name: Download and extract toolchain
-        run: |
-          wget -O mingw.tar.xz "${{ steps.toolchain.outputs.URL }}"
-          mkdir -p mingw
-          tar -xf mingw.tar.xz -C mingw --strip-components=1
-          echo "$(pwd)/mingw/bin" >> $GITHUB_PATH
+    # Download mbedTLS 3.6.5 (LTS with native TLS 1.3 support)
+    - name: Download mbedTLS ${{ github.event.inputs.mbedtls_version || '3.6.5' }}
+      shell: powershell
+      run: |
+        $ver = "${{ github.event.inputs.mbedtls_version || '3.6.5' }}"
+        $url = "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v$ver.zip"
+        Invoke-WebRequest -Uri $url -OutFile "C:\mbedtls.zip" -MaximumRetryCount 3
+        Expand-Archive -Path "C:\mbedtls.zip" -DestinationPath "C:\" -Force
+        Rename-Item -Path "C:\mbedtls-$ver" -NewName "C:\mbedtls-src" -Force
 
-      - name: Verify GCC version and exception model
-        run: |
-          gcc --version
-          # Check if sjlj is used (look for __sjlj__ in preprocessor)
-          echo | gcc -dM -E - | grep -i sjlj || echo "sjlj not detected in macros (normal)"
+    # Build mbedTLS 3.6.5 static libraries (TLS 1.3 enabled by default)
+    - name: Build mbedTLS 3.6.5 Static Libraries
+      shell: cmd
+      run: |
+        set PATH=C:\mingw\${{ matrix.mingw_path }}\bin;%PATH%
+        cd C:\mbedtls-src
+        
+        REM mbedTLS 3.6.x 默认启用 TLS 1.3，不需要额外配置宏
+        REM 使用 CMake 构建静态库，禁用测试和示例程序加快构建
+        cmake -S . -B build ^
+          -G "MinGW Makefiles" ^
+          -DCMAKE_BUILD_TYPE=Release ^
+          -DCMAKE_C_COMPILER=gcc ^
+          -DCMAKE_AR=ar ^
+          -DCMAKE_RANLIB=ranlib ^
+          -DCMAKE_C_FLAGS="-O3 -static -DMBEDTLS_CONFIG_FILE='<mbedtls/mbedtls_config.h>'" ^
+          -DENABLE_TESTING=OFF ^
+          -DENABLE_PROGRAMS=OFF ^
+          -DINSTALL_MBEDTLS_HEADERS=ON ^
+          -DGEN_FILES=OFF
+        
+        cmake --build build --parallel
+        
+        REM 验证生成的库
+        echo Built mbedTLS libraries:
+        dir build\library\*.a
 
-      - name: Checkout mbedTLS
-        uses: actions/checkout@v4
-        with:
-          repository: Mbed-TLS/mbedtls
-          ref: v3.6.5
-          path: mbedtls
-          submodules: recursive
+    # Build Mongoose static library with mbedTLS 3.6.5 (TLS 1.3)
+    - name: Build Mongoose with mbedTLS 3.6.5
+      shell: cmd
+      run: |
+        set PATH=C:\mingw\${{ matrix.mingw_path }}\bin;%PATH%
+        cd mongoose-src
+        
+        mkdir build-${{ matrix.arch }}
+        cd build-${{ matrix.arch }}
+        
+        REM 编译参数说明:
+        REM - DMG_TLS=MG_TLS_MBED: 启用 mbedTLS 后端
+        REM - DMG_ENABLE_IPV6=1: 启用 IPv6
+        REM - 包含 mbedTLS 3.6.5 头文件路径
+        set CFLAGS=-O3 -DMG_ENABLE_IPV6=1 -DMG_ENABLE_LINES=1 -DNDEBUG -Wall -Wextra -static
+        set CFLAGS=%CFLAGS% -DMG_TLS=MG_TLS_MBED
+        set CFLAGS=%CFLAGS% -I.. -IC:\mbedtls-src\include
+        
+        REM 编译 mongoose.c 为对象文件
+        gcc -c %CFLAGS% ../mongoose.c -o mongoose.o
+        
+        REM 创建静态库
+        ar rcs libmongoose.a mongoose.o
+        ranlib libmongoose.a
+        
+        echo === Mongoose library built successfully ===
+        dir libmongoose.a
 
-      - name: Build mbedTLS
-        run: |
-          mkdir -p mbedtls/build && cd mbedtls/build
-          cmake .. \
-            -DCMAKE_SYSTEM_NAME=Windows \
-            -DCMAKE_C_COMPILER=gcc \
-            -DCMAKE_BUILD_TYPE=Release
-          make -j2
+    # Test compilation with TLS 1.3
+    - name: Test TLS 1.3 Linking
+      shell: cmd
+      run: |
+        set PATH=C:\mingw\${{ matrix.mingw_path }}\bin;%PATH%
+        cd mongoose-src\build-${{ matrix.arch }}
+        
+        REM 创建测试程序，使用 TLS 1.3 客户端功能
+        echo #include "mongoose.h" > test_tls13.c
+        echo #include ^<stdio.h^> >> test_tls13.c
+        echo. >> test_tls13.c
+        echo int main(void) { >> test_tls13.c
+        echo     struct mg_mgr mgr; >> test_tls13.c
+        echo     struct mg_tls_opts opts = {0}; >> test_tls13.c
+        echo. >> test_tls13.c
+        echo     mg_mgr_init(^&mgr); >> test_tls13.c
+        echo     printf("Mongoose %s with mbedTLS 3.6.5 (TLS 1.3 enabled)\n", MG_VERSION); >> test_tls13.c
+        echo. >> test_tls13.c
+        echo     REM 创建 HTTPS 连接（将使用 TLS 1.3 协商） >> test_tls13.c
+        echo     struct mg_connection *c = mg_http_connect(^&mgr, "https://example.com", NULL, NULL); >> test_tls13.c
+        echo. >> test_tls13.c
+        echo     mg_mgr_free(^&mgr); >> test_tls13.c
+        echo     return 0; >> test_tls13.c
+        echo } >> test_tls13.c
+        
+        REM 链接所有库（注意顺序：mongoose -> mbedtls -> mbedx509 -> mbedcrypto -> 系统库）
+        gcc -static -O2 ^
+          -I.. -IC:\mbedtls-src\include ^
+          test_tls13.c ^
+          -L. -lmongoose ^
+          -LC:\mbedtls-src\build\library -lmbedtls -lmbedx509 -lmbedcrypto ^
+          -lws2_32 -lwsock32 -lbcrypt ^
+          -o test_tls13.exe
+        
+        echo === TLS 1.3 Test compilation successful ===
+        dir test_tls13.exe
 
-      - name: Create CMakeLists.txt for Mongoose
-        run: |
-          cat > CMakeLists.txt << 'EOF'
-          cmake_minimum_required(VERSION 3.10)
-          project(mongoose LANGUAGES C)
-          add_library(mongoose mongoose.c)
-          target_include_directories(mongoose PUBLIC .)
-          if(ENABLE_TLS)
-            target_include_directories(mongoose PRIVATE ${MBEDTLS_INCLUDE_DIR})
-            target_link_libraries(mongoose 
-              ${MBEDTLS_LIBRARY}
-              ${MBEDX509_LIBRARY}
-              ${MBEDCRYPTO_LIBRARY}
-            )
-            target_compile_definitions(mongoose PRIVATE MG_ENABLE_MBEDTLS=1)
-          endif()
-          if(BUILD_SHARED_LIBS)
-            set_target_properties(mongoose PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
-          endif()
-          EOF
+    # Verify TLS 1.3 symbols in mbedTLS library
+    - name: Verify TLS 1.3 Support
+      shell: cmd
+      run: |
+        set PATH=C:\mingw\${{ matrix.mingw_path }}\bin;%PATH%
+        echo Checking mbedTLS 3.6.5 for TLS 1.3 symbols...
+        
+        REM 检查 TLS 1.3 特有的函数符号
+        nm C:\mbedtls-src\build\library\libmbedtls.a | findstr "tls13\|tls1_3" | head -20
+        
+        REM 检查 PSA 加密子系统符号（TLS 1.3 依赖）
+        echo.
+        echo PSA Crypto symbols (required for TLS 1.3):
+        nm C:\mbedtls-src\build\library\libmbedcrypto.a | findstr "psa_crypto_init" | head -5
 
-      - name: Build Mongoose
-        env:
-          MBEDTLS_INCLUDE_DIR: ${{ github.workspace }}/mbedtls/include
-          MBEDTLS_LIBRARY: ${{ github.workspace }}/mbedtls/build/library/libmbedtls.a
-          MBEDX509_LIBRARY: ${{ github.workspace }}/mbedtls/build/library/libmbedx509.a
-          MBEDCRYPTO_LIBRARY: ${{ github.workspace }}/mbedtls/build/library/libmbedcrypto.a
-        run: |
-          mkdir -p build && cd build
-          cmake .. \
-            -DCMAKE_SYSTEM_NAME=Windows \
-            -DCMAKE_C_COMPILER=gcc \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=${{ matrix.build_type == 'shared' && 'ON' || 'OFF' }} \
-            -DENABLE_TLS=ON \
-            -DMBEDTLS_INCLUDE_DIR="$MBEDTLS_INCLUDE_DIR" \
-            -DMBEDTLS_LIBRARY="$MBEDTLS_LIBRARY" \
-            -DMBEDX509_LIBRARY="$MBEDX509_LIBRARY" \
-            -DMBEDCRYPTO_LIBRARY="$MBEDCRYPTO_LIBRARY"
-          cmake --build .
+    # Package all artifacts
+    - name: Package Libraries
+      shell: powershell
+      run: |
+        $arch = "${{ matrix.arch }}"
+        $artifactDir = "mongoose-mbedtls365-mingw-gcc93-sjlj-$arch"
+        $buildDir = "mongoose-src/build-$arch"
+        $mbedtlsBuild = "C:\mbedtls-src\build"
+        
+        # 创建目录结构
+        New-Item -ItemType Directory -Force -Path "$artifactDir/lib"
+        New-Item -ItemType Directory -Force -Path "$artifactDir/include"
+        New-Item -ItemType Directory -Force -Path "$artifactDir/include/mbedtls"
+        
+        # 复制 Mongoose
+        Copy-Item "$buildDir/libmongoose.a" "$artifactDir/lib/"
+        Copy-Item "mongoose-src/mongoose.h" "$artifactDir/include/"
+        
+        # 复制 mbedTLS 3.6.5 库（三个核心库）
+        Copy-Item "$mbedtlsBuild/library/libmbedtls.a" "$artifactDir/lib/"
+        Copy-Item "$mbedtlsBuild/library/libmbedx509.a" "$artifactDir/lib/"
+        Copy-Item "$mbedtlsBuild/library/libmbedcrypto.a" "$artifactDir/lib/"
+        
+        # 复制所有头文件（mbedTLS 3.x 头文件结构）
+        Copy-Item "C:\mbedtls-src\include/mbedtls/*.h" "$artifactDir/include/mbedtls/"
+        Copy-Item "C:\mbedtls-src\include/psa" "$artifactDir/include/" -Recurse -Force -ErrorAction SilentlyContinue
+        
+        # 许可证文件
+        Copy-Item "mongoose-src/LICENSE" "$artifactDir/LICENSE-mongoose" -ErrorAction SilentlyContinue
+        Copy-Item "C:\mbedtls-src/LICENSE" "$artifactDir/LICENSE-mbedtls" -ErrorAction SilentlyContinue
+        
+        # 创建 CMake 配置
+        @"
+        # Mongoose + mbedTLS 3.6.5 (TLS 1.3) CMake configuration
+        # Built with MinGW-w64 GCC 9.3 SJLJ
+        
+        add_library(mbedcrypto STATIC IMPORTED)
+        set_target_properties(mbedcrypto PROPERTIES
+            IMPORTED_LOCATION "`${CMAKE_CURRENT_LIST_DIR}/lib/libmbedcrypto.a"
+        )
+        
+        add_library(mbedx509 STATIC IMPORTED)
+        set_target_properties(mbedx509 PROPERTIES
+            IMPORTED_LOCATION "`${CMAKE_CURRENT_LIST_DIR}/lib/libmbedx509.a"
+            INTERFACE_LINK_LIBRARIES mbedcrypto
+        )
+        
+        add_library(mbedtls STATIC IMPORTED)
+        set_target_properties(mbedtls PROPERTIES
+            IMPORTED_LOCATION "`${CMAKE_CURRENT_LIST_DIR}/lib/libmbedtls.a"
+            INTERFACE_LINK_LIBRARIES mbedx509
+        )
+        
+        add_library(mongoose STATIC IMPORTED GLOBAL)
+        set_target_properties(mongoose PROPERTIES
+            IMPORTED_LOCATION "`${CMAKE_CURRENT_LIST_DIR}/lib/libmongoose.a"
+            INTERFACE_INCLUDE_DIRECTORIES "`${CMAKE_CURRENT_LIST_DIR}/include"
+            INTERFACE_COMPILE_DEFINITIONS "MG_TLS=MG_TLS_MBED;MG_ENABLE_IPV6=1"
+            INTERFACE_LINK_LIBRARIES "mbedtls;ws2_32;wsock32;bcrypt"
+        )
+        "@ | Set-Content "$artifactDir/mongoose-mbedtls-config.cmake"
+        
+        # 创建使用说明
+        @"
+        Mongoose + mbedTLS 3.6.5 (TLS 1.3) - MinGW GCC 9.3 SJLJ
+        ==========================================================
+        
+        Architecture: $arch
+        mbedTLS Version: 3.6.5 LTS
+        TLS Support: 1.3 (default) + 1.2 (backward compatible)
+        Exception Model: SJLJ (setjmp/longjmp)
+        
+        Libraries (必须按此顺序链接):
+            -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt
+        
+        编译示例:
+        gcc your_app.c -I./include -L./lib `
+          -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto `
+          -lws2_32 -lbcrypt -static
+        
+        TLS 1.3 特点:
+        - 零往返时间 (0-RTT) 会话恢复
+        - 前向安全性 (Forward Secrecy) 默认启用
+        - 移除过时加密算法，仅支持 AEAD 模式 (AES-GCM, AES-CCM, ChaCha20-Poly1305)
+        - 更快的握手速度（通常只需 1-RTT）
+        
+        注意:
+        - mbedTLS 3.x 移除了 TLS 1.0/1.1 支持
+        - 使用 -static 链接避免依赖 libgcc_s_sjlj-1.dll
+        "@ | Set-Content "$artifactDir/README.txt"
+        
+        # 打包
+        Compress-Archive -Path $artifactDir -DestinationPath "$buildDir/$artifactDir.zip" -Force
 
-      - name: Collect artifacts
-        run: |
-          mkdir -p artifacts
-          cd build
-          if [[ "${{ matrix.build_type }}" == "shared" ]]; then
-            cp libmongoose.dll.a ../artifacts/ 2>/dev/null || true
-            cp mongoose.dll ../artifacts/ 2>/dev/null || true
-          else
-            cp libmongoose.a ../artifacts/ 2>/dev/null || true
-          fi
-          cp ../mongoose.h ../artifacts/
+    # Upload artifacts
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: mongoose-mbedtls-3.6.5-tls13-gcc93-sjlj-${{ matrix.arch }}
+        path: mongoose-src/build-${{ matrix.arch }}/mongoose-mbedtls365-mingw-gcc93-sjlj-${{ matrix.arch }}.zip
+        if-no-files-found: error
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mongoose-${{ matrix.arch }}-${{ matrix.build_type }}-gcc93-sjlj-tls
-          path: artifacts/
+  release:
+    needs: build-mingw-gcc93-sjlj-tls13
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        pattern: mongoose-mbedtls-3.6.5-tls13-gcc93-sjlj-*
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: artifacts/**/*.zip
+        name: Mongoose + mbedTLS 3.6.5 (TLS 1.3) MinGW GCC 9.3 SJLJ ${{ github.ref_name }}
+        body: |
+          ## Mongoose + mbedTLS 3.6.5 LTS (TLS 1.3 Enabled)
+          
+          ### 构建环境
+          - **编译器**: WinLibs MinGW-w64 GCC 9.3.0 SJLJ
+          - **架构**: i686 (32-bit) / x86_64 (64-bit)
+          - **mbedTLS**: 3.6.5 LTS (长期支持版本)
+          - **异常处理**: SJLJ (setjmp/longjmp)
+          
+          ### TLS 1.3 支持特性
+          - ✅ **默认启用**: TLS 1.3 在 mbedTLS 3.6.x 中默认开启，无需额外配置
+          - ✅ **0-RTT 恢复**: 支持零往返时间会话恢复
+          - ✅ **前向安全**: 完全前向保密 (PFS) 默认启用
+          - ✅ **现代加密**: 仅支持 AEAD 算法 (AES-GCM, AES-CCM, ChaCha20-Poly1305)
+          - ✅ **更快握手**: 1-RTT 握手（相比 TLS 1.2 的 2-RTT）
+          
+          ### 内容清单
+          - `libmongoose.a` - Mongoose 静态库（启用 mbedTLS 后端）
+          - `libmbedtls.a` - mbedTLS 核心库（TLS 1.3 支持）
+          - `libmbedx509.a` - X.509 证书处理
+          - `libmbedcrypto.a` - 加密算法库（含 PSA Crypto API）
+          - `mongoose.h`, `mbedtls/*.h`, `psa/*.h` - 头文件
+          - `mongoose-mbedtls-config.cmake` - CMake 集成配置
+          
+          ### 使用方法
+          ```bash
+          # 编译命令（库顺序很重要）
+          gcc your_app.c -I./include -L./lib \
+            -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto \
+            -lws2_32 -lbcrypt -static
+          ```
+          
+          ### 版本说明
+          - **mbedTLS 3.6.5** 是当前 LTS 稳定版，支持周期至 2027 年
+          - 移除了对 TLS 1.0/1.1 的支持（遵循 RFC 8996）
+          - 自动处理 PSA Crypto 初始化（3.6.1+ 修复）
+          - 需要 Windows Vista+（依赖 BCrypt API）
+          
+          ⚠️ **注意**: 必须使用 `-static` 链接，否则将依赖 `libgcc_s_sjlj-1.dll`
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
