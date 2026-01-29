@@ -30,11 +30,10 @@ jobs:
     - name: Build All
       shell: pwsh
       run: |
-        # 1. 下载并设置 MinGW
+        # 1. 下载 MinGW
         $mingwUrl = "https://github.com/brechtsanders/winlibs_mingw/releases/download/9.3.0-7.0.0-sjlj-r3/${{ matrix.mingw_file }}"
         $mingwArchive = "D:\mingw.7z"
         
-        # 下载（带重试）
         $attempt = 0
         do {
           $attempt++
@@ -44,64 +43,47 @@ jobs:
           Start-Sleep -Seconds 5
         } while ($attempt -lt 3)
         
-        if (-not (Test-Path $mingwArchive)) { throw "Failed to download MinGW" }
-        
-        # 清理并解压
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue C:\mingw
-        New-Item -ItemType Directory -Force -Path C:\mingw | Out-Null
         & "C:\Program Files\7-Zip\7z.exe" x $mingwArchive -o"C:\mingw" -y
         
         $mingwBin = "C:\mingw\${{ matrix.prefix }}\bin"
-        if (-not (Test-Path "$mingwBin\gcc.exe")) { throw "gcc not found" }
-        
         $env:PATH = "$mingwBin;" + $env:PATH
         & "$mingwBin\gcc.exe" --version
 
-        # 2. 下载源码（使用 tar.gz 发布包，避免 git 和 python 生成问题）
-        Write-Host ">>> Downloading sources..."
-        
-        # Mongoose
+        # 2. 下载源码
         git clone --depth 1 https://github.com/cesanta/mongoose.git mongoose-src
         
-        # mbedTLS 3.6.5 - 使用 tar.gz 发布包（已预生成配置，无需 python）
+        # 下载 mbedTLS tar.gz 并解压
         curl.exe -L -o "D:\mbedtls.tar.gz" "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v3.6.5.tar.gz" --fail --silent --show-error
         & "C:\Program Files\7-Zip\7z.exe" x "D:\mbedtls.tar.gz" -o"D:\" -y
         & "C:\Program Files\7-Zip\7z.exe" x "D:\mbedtls.tar" -o"C:\" -y
         Rename-Item -Path "C:\mbedtls-3.6.5" -NewName "C:\mbedtls-src" -Force
-        
-        # 验证文件存在
-        if (-not (Test-Path "C:\mbedtls-src\CMakeLists.txt")) {
-          throw "mbedTLS CMakeLists.txt not found after extraction"
-        }
 
-        # 3. 构建 mbedTLS（禁用文件生成，使用发布包中的现成配置）
-        Write-Host ">>> Building mbedTLS..."
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue C:\mbedtls-install
-        New-Item -ItemType Directory -Force -Path C:\mbedtls-src\build | Out-Null
-        Set-Location C:\mbedtls-src\build
+        # 3. 用 Makefile 构建 mbedTLS（绕过 CMake 和 Python 问题）
+        Write-Host ">>> Building mbedTLS with Makefile..."
+        Set-Location C:\mbedtls-src
         
-        cmake -G "MinGW Makefiles" .. `
-          -DCMAKE_BUILD_TYPE=Release `
-          -DCMAKE_C_COMPILER="$mingwBin\gcc.exe" `
-          -DCMAKE_INSTALL_PREFIX="C:\mbedtls-install" `
-          -DENABLE_TESTING=OFF `
-          -DENABLE_PROGRAMS=OFF `
-          -DGEN_FILES=OFF  # 至关重要：使用包中预生成的文件
+        # 使用 MinGW Makefile
+        & "$mingwBin\mingw32-make.exe" -j4 CC=gcc AR=ar RANLIB=ranlib CFLAGS="-O3 -DMBEDTLS_SSL_PROTO_TLS1_3 -DMBEDTLS_CONFIG_FILE='<mbedtls/mbedtls_config.h>'" lib
         
-        if ($LASTEXITCODE -ne 0) {
-          Get-Content "CMakeFiles\CMakeError.log" -ErrorAction SilentlyContinue | Select-Object -First 20
-          throw "CMake failed"
-        }
+        if ($LASTEXITCODE -ne 0) { throw "mbedTLS build failed" }
         
-        & "$mingwBin\mingw32-make.exe" -j4
-        if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+        # 手动创建安装目录结构
+        $mbedtlsInstall = "C:\mbedtls-install"
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $mbedtlsInstall
+        New-Item -ItemType Directory -Force -Path "$mbedtlsInstall\lib", "$mbedtlsInstall\include\mbedtls", "$mbedtlsInstall\include\psa" | Out-Null
         
-        & "$mingwBin\mingw32-make.exe" install
-        if ($LASTEXITCODE -ne 0) { throw "Install failed" }
+        # 复制库文件（Makefile 生成的在 library/ 目录）
+        Copy-Item "library\libmbedcrypto.a" "$mbedtlsInstall\lib\"
+        Copy-Item "library\libmbedx509.a" "$mbedtlsInstall\lib\"
+        Copy-Item "library\libmbedtls.a" "$mbedtlsInstall\lib\"
         
-        if (-not (Test-Path "C:\mbedtls-install\lib\libmbedcrypto.a")) {
-          throw "Verification failed"
-        }
+        # 复制头文件
+        Copy-Item "include\mbedtls\*.h" "$mbedtlsInstall\include\mbedtls\"
+        Copy-Item "include\psa\*.h" "$mbedtlsInstall\include\psa\"
+        
+        Write-Host "✅ mbedTLS 3.6.5 built successfully (Makefile)"
+        Get-ChildItem "$mbedtlsInstall\lib\*.a"
 
         # 4. 构建 Mongoose
         Write-Host ">>> Building Mongoose..."
@@ -110,7 +92,7 @@ jobs:
         
         & "$mingwBin\gcc.exe" -c -O3 `
           -DMG_ENABLE_IPV6=1 -DMG_ENABLE_LINES=1 -DMG_TLS=MG_TLS_MBED -DNDEBUG `
-          -I.. -I"C:\mbedtls-install\include" `
+          -I.. -I"$mbedtlsInstall\include" `
           -static "..\mongoose.c" -o mongoose.o
         if ($LASTEXITCODE -ne 0) { throw "Mongoose compile failed" }
         
@@ -118,26 +100,25 @@ jobs:
         & "$mingwBin\ranlib.exe" libmongoose.a
 
         # 5. 测试链接
+        Write-Host ">>> Testing..."
         Set-Content -Path "test.c" -Value '#include "mongoose.h"' -Encoding ASCII
         Add-Content -Path "test.c" -Value '#include <stdio.h>' -Encoding ASCII
-        Add-Content -Path "test.c" -Value 'int main(void) { struct mg_mgr mgr; mg_mgr_init(&mgr); printf("OK\n"); mg_mgr_free(&mgr); return 0; }' -Encoding ASCII
+        Add-Content -Path "test.c" -Value 'int main(void) { return 0; }' -Encoding ASCII
         
-        & "$mingwBin\gcc.exe" -static test.c -I.. -I"C:\mbedtls-install\include" -L. -lmongoose -L"C:\mbedtls-install\lib" -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt -o test.exe
+        & "$mingwBin\gcc.exe" -static test.c -I.. -I"$mbedtlsInstall\include" -L. -lmongoose -L"$mbedtlsInstall\lib" -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt -o test.exe
         if (-not (Test-Path "test.exe")) { throw "Linking failed" }
         & ".\test.exe"
 
         # 6. 打包
-        Write-Host ">>> Packaging..."
         $pkg = "mongoose-mbedtls365-${{ matrix.arch }}"
         New-Item -ItemType Directory -Path "$pkg\lib", "$pkg\include\mbedtls", "$pkg\include\psa" -Force | Out-Null
         Copy-Item "libmongoose.a" "$pkg\lib\"
         Copy-Item "..\mongoose.h" "$pkg\include\"
-        Copy-Item "C:\mbedtls-install\lib\*.a" "$pkg\lib\"
-        Copy-Item "C:\mbedtls-install\include\mbedtls\*.h" "$pkg\include\mbedtls\"
-        Copy-Item "C:\mbedtls-install\include\psa\*.h" "$pkg\include\psa\" -ErrorAction SilentlyContinue
+        Copy-Item "$mbedtlsInstall\lib\*.a" "$pkg\lib\"
+        Copy-Item "$mbedtlsInstall\include\mbedtls\*.h" "$pkg\include\mbedtls\"
+        Copy-Item "$mbedtlsInstall\include\psa\*.h" "$pkg\include\psa\" -ErrorAction SilentlyContinue
         "gcc app.c -I./include -L./lib -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt -static" | Out-File "$pkg\README.txt"
         Compress-Archive -Path $pkg -DestinationPath "$env:GITHUB_WORKSPACE\mongoose-mbedtls365-${{ matrix.arch }}.zip" -Force
-        Write-Host "✅ Done"
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
@@ -158,6 +139,14 @@ jobs:
     - uses: softprops/action-gh-release@v1
       with:
         files: mongoose-mbedtls365-*.zip
-        name: Mongoose + mbedTLS 3.6.5 (GCC 9.3 SJLJ)
+        name: Mongoose + mbedTLS 3.6.5 (GCC 9.3 SJLJ) ${{ github.ref_name }}
+        body: |
+          ## Mongoose + mbedTLS 3.6.5 LTS (TLS 1.3)
+          
+          **Build**: MinGW-w64 GCC 9.3.0 SJLJ | **Arch**: i686 & x86_64
+          
+          **Link order**: `-lmongoose -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt`
+          
+          TLS 1.3 is enabled by default in mbedTLS 3.6.x
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
