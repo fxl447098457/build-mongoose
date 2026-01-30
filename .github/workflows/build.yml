@@ -4,6 +4,11 @@ on:
   push:
     tags: [ 'v*' ]
   workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (如: 7.20-3.6.5)'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -30,7 +35,7 @@ jobs:
     - name: Build All
       shell: pwsh
       run: |
-        # 1. 下载 MinGW
+        # 1. 下载 MinGW（修复：去掉 URL 中的空格）
         $mingwUrl = "https://github.com/brechtsanders/winlibs_mingw/releases/download/9.3.0-7.0.0-sjlj-r3/${{ matrix.mingw_file }}"
         $mingwArchive = "D:\mingw.7z"
         
@@ -49,13 +54,11 @@ jobs:
         $env:PATH = "$mingwBin;" + $env:PATH
         & "$mingwBin\gcc.exe" --version
 
-        # 2. 下载源码（Mongoose 用 git，mbedTLS 也用 git clone --recursive 获取 framework 子模块）
+        # 2. 下载源码
         git clone --depth 1 https://github.com/cesanta/mongoose.git mongoose-src
-        
-        # 关键修复：使用 --recursive 克隆 mbedTLS 获取 framework 子模块
         git clone --recursive --depth 1 --branch v3.6.5 https://github.com/Mbed-TLS/mbedtls.git C:\mbedtls-src
 
-        # 3. 用 CMake 构建 mbedTLS（避免 Makefile 的 Python 依赖问题）
+        # 3. 构建 mbedTLS
         Write-Host ">>> Building mbedTLS..."
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue C:\mbedtls-install
         
@@ -117,19 +120,70 @@ jobs:
         name: mongoose-mbedtls365-${{ matrix.arch }}
         path: mongoose-mbedtls365-*.zip
 
+  # Release 任务：支持 Tag 推送和手动触发自动发布
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    # 关键修改：只要构建成功就发布（不管是 tag 还是手动触发）
+    if: always() && needs.build.result == 'success'
     permissions:
       contents: write
+    
     steps:
     - uses: actions/download-artifact@v4
       with:
         merge-multiple: true
-    - uses: softprops/action-gh-release@v1
+        path: artifacts
+    
+    # 创建或获取 Tag（如果是手动触发且没有输入版本号，使用日期时间）
+    - name: Create Tag if needed
+      if: github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')
+      id: create_tag
+      run: |
+        # 使用输入的版本号，或自动生成
+        VERSION="${{ github.event.inputs.version }}"
+        if [ -z "$VERSION" ]; then
+          VERSION="build-$(date +%Y%m%d-%H%M%S)"
+        else
+          VERSION="v${VERSION}"
+        fi
+        echo "tag_name=$VERSION" >> $GITHUB_OUTPUT
+        echo "Creating tag: $VERSION"
+        
+        # 创建轻量级标签并推送
+        git tag "$VERSION"
+        git push origin "$VERSION"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    # 发布到 Release
+    - name: Release
+      uses: softprops/action-gh-release@v1
       with:
-        files: mongoose-mbedtls365-*.zip
-        name: Mongoose + mbedTLS 3.6.5 (GCC 9.3 SJLJ) ${{ github.ref_name }}
+        files: artifacts/**/*.zip
+        # 如果是手动触发，使用创建的 tag；如果是 tag 推送，使用原有 tag
+        tag_name: ${{ steps.create_tag.outputs.tag_name || github.ref_name }}
+        name: Mongoose + mbedTLS (GCC 9.3 SJLJ) ${{ steps.create_tag.outputs.tag_name || github.ref_name }}
+        body: |
+          ## Mongoose + mbedTLS 静态库 (TLS 1.3)
+          
+          **编译环境**: MinGW-w64 GCC 9.3.0 SJLJ
+          
+          ### 包含文件
+          - `libmongoose.a` - Mongoose 主库
+          - `libmbedtls.a`, `libmbedx509.a`, `libmbedcrypto.a` - mbedTLS 3.6.5 LTS 库
+          - 所有头文件
+          
+          ### 使用方法
+          ```bash
+          gcc your_app.c -I./include -L./lib \\
+            -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto \\
+            -lws2_32 -lbcrypt -static
+          ```
+          
+          ### 架构
+          - `*-i686.zip` - 32位版本
+          - `*-x86_64.zip` - 64位版本
+        generate_release_notes: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
