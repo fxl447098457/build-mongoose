@@ -35,7 +35,7 @@ jobs:
     - name: Build All
       shell: pwsh
       run: |
-        # 1. 下载 MinGW（修复：去掉 URL 中的空格）
+        # 1. 下载 MinGW
         $mingwUrl = "https://github.com/brechtsanders/winlibs_mingw/releases/download/9.3.0-7.0.0-sjlj-r3/${{ matrix.mingw_file }}"
         $mingwArchive = "D:\mingw.7z"
         
@@ -47,10 +47,14 @@ jobs:
           Start-Sleep -Seconds 5
         } while ($attempt -lt 3)
         
+        if (-not (Test-Path $mingwArchive)) { throw "Failed to download MinGW" }
+        
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue C:\mingw
         & "C:\Program Files\7-Zip\7z.exe" x $mingwArchive -o"C:\mingw" -y
         
         $mingwBin = "C:\mingw\${{ matrix.prefix }}\bin"
+        if (-not (Test-Path "$mingwBin\gcc.exe")) { throw "gcc.exe not found" }
+        
         $env:PATH = "$mingwBin;" + $env:PATH
         & "$mingwBin\gcc.exe" --version
 
@@ -95,6 +99,7 @@ jobs:
         & "$mingwBin\ranlib.exe" libmongoose.a
 
         # 5. 测试链接
+        Write-Host ">>> Testing..."
         Set-Content -Path "test.c" -Value '#include "mongoose.h"' -Encoding ASCII
         Add-Content -Path "test.c" -Value '#include <stdio.h>' -Encoding ASCII
         Add-Content -Path "test.c" -Value 'int main(void) { printf("OK\n"); return 0; }' -Encoding ASCII
@@ -104,6 +109,7 @@ jobs:
         & ".\test.exe"
 
         # 6. 打包
+        Write-Host ">>> Packaging..."
         $pkg = "mongoose-mbedtls365-${{ matrix.arch }}"
         New-Item -ItemType Directory -Path "$pkg\lib", "$pkg\include\mbedtls", "$pkg\include\psa" -Force | Out-Null
         Copy-Item "libmongoose.a" "$pkg\lib\"
@@ -113,6 +119,7 @@ jobs:
         Copy-Item "C:\mbedtls-install\include\psa\*.h" "$pkg\include\psa\" -ErrorAction SilentlyContinue
         "gcc app.c -I./include -L./lib -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto -lws2_32 -lbcrypt -static" | Out-File "$pkg\README.txt"
         Compress-Archive -Path $pkg -DestinationPath "$env:GITHUB_WORKSPACE\mongoose-mbedtls365-${{ matrix.arch }}.zip" -Force
+        Write-Host "Package created: mongoose-mbedtls365-${{ matrix.arch }}.zip"
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
@@ -120,70 +127,83 @@ jobs:
         name: mongoose-mbedtls365-${{ matrix.arch }}
         path: mongoose-mbedtls365-*.zip
 
-  # Release 任务：支持 Tag 推送和手动触发自动发布
   release:
     needs: build
     runs-on: ubuntu-latest
-    # 关键修改：只要构建成功就发布（不管是 tag 还是手动触发）
     if: always() && needs.build.result == 'success'
     permissions:
       contents: write
     
     steps:
+    # 关键修复：必须先检出代码才能打标签
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # 获取完整git历史以便打标签
+    
     - uses: actions/download-artifact@v4
       with:
         merge-multiple: true
         path: artifacts
     
-    # 创建或获取 Tag（如果是手动触发且没有输入版本号，使用日期时间）
-    - name: Create Tag if needed
+    # 手动触发时创建标签
+    - name: Create Tag
       if: github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')
       id: create_tag
       run: |
-        # 使用输入的版本号，或自动生成
+        # 获取输入的版本号并清理（去掉空格等非法字符）
         VERSION="${{ github.event.inputs.version }}"
+        VERSION=$(echo "$VERSION" | tr -d ' ' | tr -d '"' | tr -d "'" | tr -d '/' | tr -d '\\')
+        
         if [ -z "$VERSION" ]; then
           VERSION="build-$(date +%Y%m%d-%H%M%S)"
         else
           VERSION="v${VERSION}"
         fi
+        
         echo "tag_name=$VERSION" >> $GITHUB_OUTPUT
         echo "Creating tag: $VERSION"
         
-        # 创建轻量级标签并推送
+        # 配置Git用户信息（GitHub Actions必需）
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # 创建并推送轻量级标签
         git tag "$VERSION"
         git push origin "$VERSION"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     
-    # 发布到 Release
-    - name: Release
+    # 发布到Release
+    - name: Release to GitHub
       uses: softprops/action-gh-release@v1
       with:
         files: artifacts/**/*.zip
-        # 如果是手动触发，使用创建的 tag；如果是 tag 推送，使用原有 tag
         tag_name: ${{ steps.create_tag.outputs.tag_name || github.ref_name }}
         name: Mongoose + mbedTLS (GCC 9.3 SJLJ) ${{ steps.create_tag.outputs.tag_name || github.ref_name }}
         body: |
           ## Mongoose + mbedTLS 静态库 (TLS 1.3)
           
-          **编译环境**: MinGW-w64 GCC 9.3.0 SJLJ
+          **编译环境**: MinGW-w64 GCC 9.3.0 SJLJ | **mbedTLS**: 3.6.5 LTS
           
           ### 包含文件
-          - `libmongoose.a` - Mongoose 主库
-          - `libmbedtls.a`, `libmbedx509.a`, `libmbedcrypto.a` - mbedTLS 3.6.5 LTS 库
-          - 所有头文件
+          - `libmongoose.a` - Mongoose库（启用mbedTLS后端）
+          - `libmbedtls.a` - mbedTLS核心库
+          - `libmbedx509.a` - X509证书库
+          - `libmbedcrypto.a` - 加密算法库
+          - 所有头文件（`mongoose.h`, `mbedtls/*.h`, `psa/*.h`）
           
           ### 使用方法
           ```bash
-          gcc your_app.c -I./include -L./lib \\
-            -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto \\
+          gcc your_app.c -I./include -L./lib \
+            -lmongoose -lmbedtls -lmbedx509 -lmbedcrypto \
             -lws2_32 -lbcrypt -static
           ```
           
-          ### 架构
-          - `*-i686.zip` - 32位版本
-          - `*-x86_64.zip` - 64位版本
+          ### 下载
+          - `mongoose-mbedtls365-i686.zip` - **32位** (x86)
+          - `mongoose-mbedtls365-x86_64.zip` - **64位** (x64)
+          
+          ⚠️ **注意**: 必须使用 `-static` 链接，否则依赖 `libgcc_s_sjlj-1.dll`
         generate_release_notes: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
